@@ -1,12 +1,14 @@
-name: Build Helium macOS DMG (PR #915 - hover-expand-fast-hover)
+name: Build Helium macOS DMG
 
 on:
+  pull_request:
+    branches: ["main"]
   workflow_dispatch:
     inputs:
       arch:
-        description: 'Target architecture'
+        description: "Target architecture"
         required: true
-        default: 'arm64'
+        default: "arm64"
         type: choice
         options:
           - arm64
@@ -14,94 +16,106 @@ on:
 
 jobs:
   build:
-    name: Build Helium (${{ github.event.inputs.arch }})
-    # GitHub's latest macOS runner (Apple Silicon for arm64, x86_64 for Intel)
-    runs-on: ${{ github.event.inputs.arch == 'arm64' && 'macos-latest' || 'macos-13' }}
+    name: Build Helium (${{ github.event.inputs.arch || 'arm64' }})
+    # macos-latest  = Apple Silicon (arm64)
+    # macos-13      = Intel x86_64  (last Intel GitHub-hosted runner)
+    runs-on: ${{ (github.event.inputs.arch == 'x86_64') && 'macos-13' || 'macos-latest' }}
     timeout-minutes: 600
 
     steps:
-      # ── 1. Check out helium-macos (the macOS packaging repo) ──────────────
-      - name: Check out helium-macos
+      # ── 1. Check out cyfung1031/helium (this repo) at the PR head ─────────
+      #       This becomes the helium-chromium submodule inside helium-macos.
+      - name: Check out cyfung1031/helium (PR branch)
+        uses: actions/checkout@v4
+        with:
+          # For a pull_request event this resolves to the merge commit of the
+          # PR head; for workflow_dispatch it is whatever branch/sha triggered.
+          ref: ${{ github.sha }}
+          path: helium-chromium
+
+      # ── 2. Check out imputnet/helium-macos (macOS packaging) ─────────────
+      #       We clone it WITHOUT recursing submodules because we supply our
+      #       own helium-chromium checkout above.
+      - name: Check out imputnet/helium-macos
         uses: actions/checkout@v4
         with:
           repository: imputnet/helium-macos
           ref: main
           path: helium-macos
-          # Do NOT recurse submodules here — we override the submodule below
+          submodules: false   # we wire helium-chromium manually below
 
-      # ── 2. Check out the PR branch of cyfung1031/helium into the submodule
-      #       path so it is used instead of the pinned upstream commit ────────
-      - name: Check out PR branch (cyfung1031/helium @ pr-915-hover-expand-fast-hover)
-        uses: actions/checkout@v4
-        with:
-          repository: cyfung1031/helium
-          ref: pr-915-hover-expand-fast-hover
-          path: helium-macos/helium-chromium
+      # ── 3. Wire our helium-chromium checkout into helium-macos ───────────
+      #       env.sh sets _main_repo="$_root_dir/helium-chromium", so we just
+      #       symlink the checkout to that exact path.
+      - name: Wire helium-chromium into helium-macos
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/helium-macos/helium-chromium"
+          ln -s  "$GITHUB_WORKSPACE/helium-chromium" \
+                 "$GITHUB_WORKSPACE/helium-macos/helium-chromium"
 
-      # ── 3. Install build dependencies via Homebrew ────────────────────────
+      # ── 4. Install Homebrew dependencies ─────────────────────────────────
       - name: Install Homebrew dependencies
         run: |
           brew install python@3 llvm ninja coreutils readline xz zlib node
           brew unlink binutils || true
 
       - name: Install Python dependencies
-        run: |
-          pip3 install httplib2 --break-system-packages
+        run: pip3 install httplib2 --break-system-packages
 
-      # ── 4. Set up LLVM environment variables (required by build.sh) ───────
-      - name: Set LLVM environment variables
+      # ── 5. Expose LLVM to the build ───────────────────────────────────────
+      - name: Configure LLVM environment
         run: |
           LLVM_PREFIX="$(brew --prefix llvm)"
-          echo "LDFLAGS=-L${LLVM_PREFIX}/lib" >> "$GITHUB_ENV"
+          echo "LDFLAGS=-L${LLVM_PREFIX}/lib"      >> "$GITHUB_ENV"
           echo "CPPFLAGS=-I${LLVM_PREFIX}/include" >> "$GITHUB_ENV"
-          echo "${LLVM_PREFIX}/bin" >> "$GITHUB_PATH"
+          echo "${LLVM_PREFIX}/bin"                >> "$GITHUB_PATH"
 
-      # ── 5. Install appdmg for better DMG creation ─────────────────────────
+      # ── 6. Install appdmg (used by sign_and_package_app.sh when present) ──
       - name: Install appdmg
         run: npm install -g appdmg
 
-      # ── 6. Cache the Chromium download cache to speed up re-runs ──────────
+      # ── 7. Select Xcode ───────────────────────────────────────────────────
+      - name: Select Xcode
+        run: sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+
+      # ── 8. Cache the Chromium download cache ─────────────────────────────
+      #       Keyed on chromium_version + all .ini files; version bump busts it.
       - name: Cache Chromium download cache
         uses: actions/cache@v4
         with:
           path: helium-macos/build/download_cache
-          key: chromium-download-cache-${{ github.event.inputs.arch }}-${{ hashFiles('helium-macos/helium-chromium/chromium_version.txt', 'helium-macos/helium-chromium/downloads.ini', 'helium-macos/downloads.ini', 'helium-macos/helium-chromium/deps.ini') }}
+          key: dl-cache-${{ runner.arch }}-${{ hashFiles('helium-chromium/chromium_version.txt', 'helium-chromium/downloads.ini', 'helium-chromium/deps.ini', 'helium-macos/downloads.ini') }}
           restore-keys: |
-            chromium-download-cache-${{ github.event.inputs.arch }}-
+            dl-cache-${{ runner.arch }}-
 
-      # ── 7. Open Xcode (required by build tooling) ─────────────────────────
-      - name: Open Xcode
-        run: sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
-
-      # ── 8. Run the build ──────────────────────────────────────────────────
+      # ── 9. Build ──────────────────────────────────────────────────────────
       #
-      #   build.sh flow (from source):
-      #     retrieve_and_unpack_resource.sh -g $arch   → clone / download Chromium source
-      #     retrieve_and_unpack_resource.sh -t         → download clang + rust toolchain
+      #   build.sh (from helium-macos) does in order:
+      #     retrieve_and_unpack_resource.sh -g $arch  → download Chromium source
+      #     retrieve_and_unpack_resource.sh -t        → download clang + rust
       #     prune_binaries.py
-      #     patches.py apply
+      #     patches.py apply    ← patches from helium-chromium AND helium-macos
       #     domain_substitution.py apply
       #     name_substitution.py
       #     helium_version.py
-      #     generate_resources.py / replace_resources.py
-      #     gn gen + ninja chrome chromedriver
-      #     sign_and_package_app.sh  → produces .dmg (unsigned, no MACOS_CERTIFICATE_NAME)
+      #     generate/replace_resources.py
+      #     gn bootstrap → gn gen → ninja chrome chromedriver
+      #     sign_and_package_app.sh  → writes build/*.dmg
       #
-      - name: Build Helium
+      #   No MACOS_CERTIFICATE_NAME → ad-hoc codesign only (fine for testing).
+      #   NEEDS_APPDMG=1 tells sign_and_package_app.sh to use appdmg.
+      #
+      - name: Build
         working-directory: helium-macos
-        run: ./build.sh ${{ github.event.inputs.arch }}
+        run: ./build.sh ${{ github.event.inputs.arch || 'arm64' }}
         env:
-          # No signing — omitting MACOS_CERTIFICATE_NAME causes the script to
-          # fall back to `codesign --force --deep --sign -` (ad-hoc signing),
-          # which is perfectly fine for local testing.
           NEEDS_APPDMG: "1"
 
-      # ── 9. Upload the DMG as a build artifact ─────────────────────────────
+      # ── 10. Upload the DMG as a build artifact ────────────────────────────
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: helium-pr915-${{ github.event.inputs.arch }}-macos
-          # The DMG is written to build/ by sign_and_package_app.sh
+          name: helium-pr-${{ github.event.pull_request.number || 'manual' }}-${{ github.event.inputs.arch || 'arm64' }}-macos
           path: helium-macos/build/*.dmg
           if-no-files-found: error
           retention-days: 14
