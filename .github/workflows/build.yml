@@ -1,79 +1,107 @@
-name: Test PR Build
-
-permissions:
-  contents: read
+name: Build Helium macOS DMG (PR #915 - hover-expand-fast-hover)
 
 on:
-  pull_request:
-    branches: ["main"]
   workflow_dispatch:
+    inputs:
+      arch:
+        description: 'Target architecture'
+        required: true
+        default: 'arm64'
+        type: choice
+        options:
+          - arm64
+          - x86_64
 
 jobs:
-  build-macos:
-    name: Build Helium for macOS (M1/M2/M3)
-    runs-on: macos-latest
+  build:
+    name: Build Helium (${{ github.event.inputs.arch }})
+    # GitHub's latest macOS runner (Apple Silicon for arm64, x86_64 for Intel)
+    runs-on: ${{ github.event.inputs.arch == 'arm64' && 'macos-latest' || 'macos-13' }}
+    timeout-minutes: 600
 
     steps:
-      - name: Checkout helium-macos repository
+      # ── 1. Check out helium-macos (the macOS packaging repo) ──────────────
+      - name: Check out helium-macos
         uses: actions/checkout@v4
         with:
           repository: imputnet/helium-macos
-          ref: main               # change to a specific branch/tag/PR if needed
-          fetch-depth: 0
-          submodules: recursive
+          ref: main
+          path: helium-macos
+          # Do NOT recurse submodules here — we override the submodule below
 
-      - name: Install Xcode command line tools
-        run: xcode-select --install || true
-
-      - name: Update Homebrew and upgrade packages
-        run: |
-          brew update --force --quiet
-          brew upgrade --quiet
-
-      - name: Install build dependencies
-        run: brew install ninja coreutils python@3.13
-
-      - name: Set up Python 3.13
-        uses: actions/setup-python@v5
+      # ── 2. Check out the PR branch of cyfung1031/helium into the submodule
+      #       path so it is used instead of the pinned upstream commit ────────
+      - name: Check out PR branch (cyfung1031/helium @ pr-915-hover-expand-fast-hover)
+        uses: actions/checkout@v4
         with:
-          python-version: '3.13'
+          repository: cyfung1031/helium
+          ref: pr-915-hover-expand-fast-hover
+          path: helium-macos/helium-chromium
 
-      - name: Install Helium Python dependencies
+      # ── 3. Install build dependencies via Homebrew ────────────────────────
+      - name: Install Homebrew dependencies
         run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install httplib2==0.22.0 requests pillow
+          brew install python@3 llvm ninja coreutils readline xz zlib node
+          brew unlink binutils || true
 
+      - name: Install Python dependencies
+        run: |
+          pip3 install httplib2 --break-system-packages
+
+      # ── 4. Set up LLVM environment variables (required by build.sh) ───────
+      - name: Set LLVM environment variables
+        run: |
+          LLVM_PREFIX="$(brew --prefix llvm)"
+          echo "LDFLAGS=-L${LLVM_PREFIX}/lib" >> "$GITHUB_ENV"
+          echo "CPPFLAGS=-I${LLVM_PREFIX}/include" >> "$GITHUB_ENV"
+          echo "${LLVM_PREFIX}/bin" >> "$GITHUB_PATH"
+
+      # ── 5. Install appdmg for better DMG creation ─────────────────────────
+      - name: Install appdmg
+        run: npm install -g appdmg
+
+      # ── 6. Cache the Chromium download cache to speed up re-runs ──────────
+      - name: Cache Chromium download cache
+        uses: actions/cache@v4
+        with:
+          path: helium-macos/build/download_cache
+          key: chromium-download-cache-${{ github.event.inputs.arch }}-${{ hashFiles('helium-macos/helium-chromium/chromium_version.txt', 'helium-macos/helium-chromium/downloads.ini', 'helium-macos/downloads.ini', 'helium-macos/helium-chromium/deps.ini') }}
+          restore-keys: |
+            chromium-download-cache-${{ github.event.inputs.arch }}-
+
+      # ── 7. Open Xcode (required by build tooling) ─────────────────────────
+      - name: Open Xcode
+        run: sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+
+      # ── 8. Run the build ──────────────────────────────────────────────────
+      #
+      #   build.sh flow (from source):
+      #     retrieve_and_unpack_resource.sh -g $arch   → clone / download Chromium source
+      #     retrieve_and_unpack_resource.sh -t         → download clang + rust toolchain
+      #     prune_binaries.py
+      #     patches.py apply
+      #     domain_substitution.py apply
+      #     name_substitution.py
+      #     helium_version.py
+      #     generate_resources.py / replace_resources.py
+      #     gn gen + ninja chrome chromedriver
+      #     sign_and_package_app.sh  → produces .dmg (unsigned, no MACOS_CERTIFICATE_NAME)
+      #
       - name: Build Helium
-        run: |
-          echo "Current working directory: $(pwd)"
-          echo "Listing root files:"
-          ls -la .
+        working-directory: helium-macos
+        run: ./build.sh ${{ github.event.inputs.arch }}
+        env:
+          # No signing — omitting MACOS_CERTIFICATE_NAME causes the script to
+          # fall back to `codesign --force --deep --sign -` (ad-hoc signing),
+          # which is perfectly fine for local testing.
+          NEEDS_APPDMG: "1"
 
-          # Explicitly source env.sh first (it's in the repo root)
-          if [ -f "./env.sh" ]; then
-            echo "Sourcing env.sh from current directory..."
-            source ./env.sh || { echo "Failed to source env.sh"; exit 1; }
-          else
-            echo "env.sh not found in current directory!"
-            exit 1
-          fi
-
-          # Now source dev.sh (should now have environment variables loaded)
-          echo "Sourcing dev.sh..."
-          source ./dev.sh || { echo "Failed to source dev.sh"; exit 1; }
-
-          echo "Running he setup..."
-          he setup || { echo "he setup failed - check logs above for missing deps or gclient sync issues"; exit 1; }
-
-          echo "Running he build..."
-          he build || { echo "he build failed"; exit 1; }
-
-      - name: Upload build output (if any)
-        if: always()  # upload even on failure for debugging
+      # ── 9. Upload the DMG as a build artifact ─────────────────────────────
+      - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Helium-Build-Output
-          path: |
-            build/
-            out/
-          if-no-files-found: warn
+          name: helium-pr915-${{ github.event.inputs.arch }}-macos
+          # The DMG is written to build/ by sign_and_package_app.sh
+          path: helium-macos/build/*.dmg
+          if-no-files-found: error
+          retention-days: 14
