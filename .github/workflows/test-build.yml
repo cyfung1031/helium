@@ -1,0 +1,46 @@
+name: Test PR Build
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch: # Allows you to run it manually from the "Actions" tab
+
+jobs:
+  build-macos:
+    name: Build Helium for macOS (M1/M2/M3)
+    runs-on: macos-latest # This uses GitHub's cloud Mac servers
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          brew install ninja coreutils
+          # Add any other specific dependencies needed for the Helium build tool
+
+      - name: Setup Helium Environment
+        run: |
+          source dev.sh
+          he setup
+          
+      - name: Build App
+        run: |
+          source dev.sh
+          he build
+          
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Helium-Test-Build
+          path: build/Helium.app # Adjust this path if the build output is in a different folder
+          if-no-files-found: error
