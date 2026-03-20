@@ -1,0 +1,48 @@
+name: Test PR Build
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    name: Build Helium for macOS (M1/M2/M3)
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Xcode command line tools
+        run: xcode-select --install || true
+
+      - name: Update Homebrew
+        run: |
+          brew update --force --quiet
+          brew upgrade --quiet
+
+      - name: Install build dependencies
+        run: brew install ninja coreutils python@3.13
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Build Helium
+        run: |
+          source dev.sh
+          he setup
+          he build
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: Helium-Build-Output
+          path: build/
+          if-no-files-found: error
