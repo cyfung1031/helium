@@ -11,17 +11,21 @@ on:
 jobs:
   build-macos:
     name: Build Helium for macOS (M1/M2/M3)
-    runs-on: macos-latest
+    runs-on: macos-latest   # or macos-15 if you want to pin the version
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout helium-macos repository
+        uses: actions/checkout@v4
         with:
+          repository: imputnet/helium-macos
+          ref: main               # ← change to your branch/tag/PR if needed
           fetch-depth: 0
+          submodules: recursive   # Important: fetches depot_tools & other submodules
 
       - name: Install Xcode command line tools
         run: xcode-select --install || true
 
-      - name: Update Homebrew
+      - name: Update Homebrew and upgrade packages
         run: |
           brew update --force --quiet
           brew upgrade --quiet
@@ -36,13 +40,23 @@ jobs:
 
       - name: Build Helium
         run: |
-          source dev.sh
-          he setup
-          he build
+          echo "Current directory contents:"
+          ls -la
+          
+          source dev.sh || { echo "Failed to source dev.sh"; exit 1; }
+          
+          echo "Running he setup..."
+          he setup || { echo "he setup failed"; exit 1; }
+          
+          echo "Running he build..."
+          he build || { echo "he build failed"; exit 1; }
 
-      - name: Upload build output
+      - name: Upload build output (if any)
+        if: always()   # upload even on failure for debugging
         uses: actions/upload-artifact@v4
         with:
           name: Helium-Build-Output
-          path: build/
-          if-no-files-found: error
+          path: |
+            build/
+            out/
+          if-no-files-found: warn   # change to 'error' once you confirm the path
