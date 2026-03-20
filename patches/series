@@ -324,6 +324,7 @@ helium/ui/layout/vertical-hover-overlay.patch
 helium/ui/layout/vertical-hover-overlay-callers.patch
 helium/ui/layout/vertical-hover-overlay-setting.patch
 helium/ui/layout/vertical-hover-reliability.patch
+helium/ui/layout/vertical-hover-fast-stop.patch
 helium/ui/layout/vertical-hover-edit-lock.patch
 
 helium/ui/pdf-viewer.patch
