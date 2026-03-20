@@ -11,16 +11,16 @@ on:
 jobs:
   build-macos:
     name: Build Helium for macOS (M1/M2/M3)
-    runs-on: macos-latest   # or macos-15 if you want to pin the version
+    runs-on: macos-latest
 
     steps:
       - name: Checkout helium-macos repository
         uses: actions/checkout@v4
         with:
           repository: imputnet/helium-macos
-          ref: main               # ← change to your branch/tag/PR if needed
+          ref: main               # change to a specific branch/tag/PR if needed
           fetch-depth: 0
-          submodules: recursive   # Important: fetches depot_tools & other submodules
+          submodules: recursive
 
       - name: Install Xcode command line tools
         run: xcode-select --install || true
@@ -38,25 +38,42 @@ jobs:
         with:
           python-version: '3.13'
 
+      - name: Install Helium Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install httplib2==0.22.0 requests pillow
+
       - name: Build Helium
         run: |
-          echo "Current directory contents:"
-          ls -la
-          
-          source dev.sh || { echo "Failed to source dev.sh"; exit 1; }
-          
+          echo "Current working directory: $(pwd)"
+          echo "Listing root files:"
+          ls -la .
+
+          # Explicitly source env.sh first (it's in the repo root)
+          if [ -f "./env.sh" ]; then
+            echo "Sourcing env.sh from current directory..."
+            source ./env.sh || { echo "Failed to source env.sh"; exit 1; }
+          else
+            echo "env.sh not found in current directory!"
+            exit 1
+          fi
+
+          # Now source dev.sh (should now have environment variables loaded)
+          echo "Sourcing dev.sh..."
+          source ./dev.sh || { echo "Failed to source dev.sh"; exit 1; }
+
           echo "Running he setup..."
-          he setup || { echo "he setup failed"; exit 1; }
-          
+          he setup || { echo "he setup failed - check logs above for missing deps or gclient sync issues"; exit 1; }
+
           echo "Running he build..."
           he build || { echo "he build failed"; exit 1; }
 
       - name: Upload build output (if any)
-        if: always()   # upload even on failure for debugging
+        if: always()  # upload even on failure for debugging
         uses: actions/upload-artifact@v4
         with:
           name: Helium-Build-Output
           path: |
             build/
             out/
-          if-no-files-found: warn   # change to 'error' once you confirm the path
+          if-no-files-found: warn
