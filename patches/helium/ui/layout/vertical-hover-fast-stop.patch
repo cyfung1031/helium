@@ -1,0 +1,275 @@
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h
+@@ -7,6 +7,8 @@
+ 
+ #include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/timer/timer.h"
++#include "ui/gfx/geometry/point.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state.h"
+ #include "components/prefs/pref_change_registrar.h"
+ #include "components/sessions/core/session_id.h"
+@@ -53,6 +55,7 @@
+   void SetCollapsed(bool collapsed);
+   bool IsHoverExpanded() const;
+   void SetHovered(bool hovered);
++  void OnCursorMoved(const gfx::Point& screen_point);
+   void SetHoverExpansionLock(bool locked);
+ 
+   int GetUncollapsedWidth() const;
+@@ -79,6 +82,8 @@
+   bool IsHoverExpandEnabled() const;
+   void OnHoverExpandEnabledPrefChanged();
+   bool ShouldHoldExpandedForHover() const;
+   bool IsHoverExpansionLocked() const;
++  void MaybeAccelerateHoverExpand();
+   void ClearHoverHoldState(bool notify);
+   void StartHoverExpandTimerIfNeeded();
+   void OnHoverExpandDelayElapsed();
+@@ -93,6 +98,22 @@
+   VerticalTabStripState state_;
+   bool is_hovered_ = false;
+   bool held_by_hover_ = false;
+   int hover_expansion_lock_count_ = 0;
++
++  // Cursor velocity tracking for fast-stop intent acceleration.
++  // When the cursor moves fast toward the sidebar and then stops, the expand
++  // timer fires immediately rather than waiting for the full delay.
++  static constexpr size_t kVelocitySampleWindowMs = 150;
++  static constexpr size_t kMaxVelocitySamples = 6;
++  // Speed threshold in px/ms: above this is "fast", below this is "stopped".
++  static constexpr double kFastSpeedThresholdPxPerMs = 2.5;
++  static constexpr double kStopSpeedThresholdPxPerMs = 0.4;
++
++  struct CursorSample {
++    gfx::Point position;
++    base::TimeTicks timestamp;
++  };
++  std::deque<CursorSample> cursor_samples_;
++  base::RepeatingTimer cursor_velocity_timer_;
++
+   base::OneShotTimer hover_expand_timer_;
+   base::OneShotTimer hover_collapse_timer_;
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
+@@ -1,6 +1,9 @@
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ 
+ #include <optional>
++#include <cmath>
++#include <deque>
++#include "ui/gfx/geometry/point.h"
+ 
+ // ... (existing includes unchanged)
+@@ -135,6 +138,74 @@
+   StartHoverCollapseTimerIfNeeded();
+ }
+ 
++void VerticalTabStripStateController::OnCursorMoved(
++    const gfx::Point& screen_point) {
++  // Only track movement while the expand timer is pending. Once expanded (or
++  // not going to expand), velocity data is irrelevant.
++  if (!hover_expand_timer_.IsRunning()) {
++    if (!cursor_samples_.empty()) {
++      cursor_samples_.clear();
++      cursor_velocity_timer_.Stop();
++    }
++    return;
++  }
++
++  const base::TimeTicks now = base::TimeTicks::Now();
++  cursor_samples_.push_back({screen_point, now});
++
++  // Evict samples older than the window.
++  while (cursor_samples_.size() > 1) {
++    const base::TimeDelta age = now - cursor_samples_.front().timestamp;
++    if (age.InMilliseconds() > static_cast<int64_t>(kVelocitySampleWindowMs)) {
++      cursor_samples_.pop_front();
++    } else {
++      break;
++    }
++  }
++  // Also cap by count to bound memory usage.
++  while (cursor_samples_.size() > kMaxVelocitySamples) {
++    cursor_samples_.pop_front();
++  }
++
++  // Start the periodic velocity checker if not already running.
++  if (!cursor_velocity_timer_.IsRunning()) {
++    cursor_velocity_timer_.Start(
++        FROM_HERE, base::Milliseconds(30), this,
++        &VerticalTabStripStateController::MaybeAccelerateHoverExpand);
++  }
++}
++
++void VerticalTabStripStateController::MaybeAccelerateHoverExpand() {
++  // Stop checking once the expand timer is no longer pending.
++  if (!hover_expand_timer_.IsRunning()) {
++    cursor_velocity_timer_.Stop();
++    cursor_samples_.clear();
++    return;
++  }
++
++  // Need at least two samples to compute velocity.
++  if (cursor_samples_.size() < 2) {
++    return;
++  }
++
++  // Compute instantaneous speed between the two most recent samples.
++  const CursorSample& prev = cursor_samples_[cursor_samples_.size() - 2];
++  const CursorSample& curr = cursor_samples_.back();
++  const double dx = curr.position.x() - prev.position.x();
++  const double dy = curr.position.y() - prev.position.y();
++  const double dist = std::sqrt(dx * dx + dy * dy);
++  const double dt_ms = (curr.timestamp - prev.timestamp).InMillisecondsF();
++  if (dt_ms < 0.5) {
++    return;
++  }
++  const double current_speed = dist / dt_ms;
++
++  // Only accelerate if the cursor has clearly stopped (current speed is low).
++  if (current_speed >= kStopSpeedThresholdPxPerMs) {
++    return;
++  }
++
++  // Check whether any earlier sample-to-sample interval was "fast", indicating
++  // a deliberate flick-and-stop gesture rather than a slow drift.
++  bool had_fast_movement = false;
++  for (size_t i = 0; i + 1 < cursor_samples_.size(); ++i) {
++    const double sdx =
++        cursor_samples_[i + 1].position.x() - cursor_samples_[i].position.x();
++    const double sdy =
++        cursor_samples_[i + 1].position.y() - cursor_samples_[i].position.y();
++    const double sdist = std::sqrt(sdx * sdx + sdy * sdy);
++    const double sdt =
++        (cursor_samples_[i + 1].timestamp - cursor_samples_[i].timestamp)
++            .InMillisecondsF();
++    if (sdt > 0.5 && (sdist / sdt) >= kFastSpeedThresholdPxPerMs) {
++      had_fast_movement = true;
++      break;
++    }
++  }
++
++  if (!had_fast_movement) {
++    return;
++  }
++
++  // Fast-then-stopped: fire the expand immediately.
++  cursor_velocity_timer_.Stop();
++  cursor_samples_.clear();
++  hover_expand_timer_.Stop();
++  OnHoverExpandDelayElapsed();
++}
++
+ int VerticalTabStripStateController::GetUncollapsedWidth() const {
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+@@ -97,6 +97,7 @@
+   // views::View:
+   void AddedToWidget() override;
+   void Layout(PassKey) override;
++  void OnMouseMoved(const ui::MouseEvent& event) override;
+   void OnMouseEntered(const ui::MouseEvent& event) override;
+   void OnMouseExited(const ui::MouseEvent& event) override;
+   views::View* GetDefaultFocusableChild() override;
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -158,6 +158,17 @@
+                                         bounds().height()));
+ }
+ 
++void VerticalTabStripRegionView::OnMouseMoved(const ui::MouseEvent& event) {
++  TabStripRegionView::OnMouseMoved(event);
++  // Forward cursor position to the state controller for velocity tracking.
++  // This drives the fast-stop acceleration: if the user flicks the cursor
++  // to the sidebar and stops, the expand fires before the full delay elapses.
++  if (state_controller_) {
++    gfx::Point screen_point = event.location();
++    ConvertPointToScreen(this, &screen_point);
++    state_controller_->OnCursorMoved(screen_point);
++  }
++}
++
+ void VerticalTabStripRegionView::OnMouseEntered(const ui::MouseEvent& event) {
+   TabStripRegionView::OnMouseEntered(event);
+   state_controller_->SetHovered(true);
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_unittest.cc
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller_unittest.cc
+@@ -280,6 +280,75 @@
+   EXPECT_FALSE(controller()->IsHoverExpanded());
+ }
+ 
++// ---------------------------------------------------------------------------
++// Fast-stop cursor acceleration tests
++// ---------------------------------------------------------------------------
++
++// Helper: simulate a sequence of mouse-move events. |positions| is a list of
++// (x, y, delta_ms) tuples — position and time elapsed since the previous call.
++// The first entry's delta_ms is elapsed since "now" (i.e. test start).
++
++TEST_F(VerticalTabStripStateControllerTest,
++       FastStopAcceleratesExpandBeforeFullDelay) {
++  pref_service()->SetInteger(prefs::kHeliumLayout,
++                             std::to_underlying(HeliumLayoutType::kVertical));
++  controller()->SetCollapsed(true);
++  controller()->SetHovered(true);
++
++  // Simulate fast movement (70 px in 20 ms = 3.5 px/ms) followed by a stop.
++  controller()->OnCursorMoved(gfx::Point(10, 200));
++  task_environment_.FastForwardBy(base::Milliseconds(20));
++  controller()->OnCursorMoved(gfx::Point(80, 200));
++  task_environment_.FastForwardBy(base::Milliseconds(20));
++  // Near-stop: only 2 px in 20 ms = 0.1 px/ms
++  controller()->OnCursorMoved(gfx::Point(82, 200));
++
++  // Tick the velocity checker (fires every 30 ms).
++  task_environment_.FastForwardBy(base::Milliseconds(30));
++
++  // Should be expanded well before the normal 300 ms delay.
++  EXPECT_TRUE(controller()->IsHoverExpanded());
++}
++
++TEST_F(VerticalTabStripStateControllerTest,
++       SlowMovementDoesNotAccelerateExpand) {
++  pref_service()->SetInteger(prefs::kHeliumLayout,
++                             std::to_underlying(HeliumLayoutType::kVertical));
++  controller()->SetCollapsed(true);
++  controller()->SetHovered(true);
++
++  // Slow drift: 5 px per 50 ms = 0.1 px/ms throughout — never "fast".
++  controller()->OnCursorMoved(gfx::Point(10, 200));
++  task_environment_.FastForwardBy(base::Milliseconds(50));
++  controller()->OnCursorMoved(gfx::Point(15, 200));
++  task_environment_.FastForwardBy(base::Milliseconds(50));
++  controller()->OnCursorMoved(gfx::Point(17, 200));
++  task_environment_.FastForwardBy(base::Milliseconds(30));  // velocity tick
++
++  // Not yet expanded (no fast movement was seen, so no acceleration).
++  EXPECT_FALSE(controller()->IsHoverExpanded());
++
++  // Normal delay should still fire eventually.
++  task_environment_.FastForwardBy(base::Milliseconds(300));
++  EXPECT_TRUE(controller()->IsHoverExpanded());
++}
++
++TEST_F(VerticalTabStripStateControllerTest,
++       VelocityTrackingStopsOncePanelExpands) {
++  pref_service()->SetInteger(prefs::kHeliumLayout,
++                             std::to_underlying(HeliumLayoutType::kVertical));
++  controller()->SetCollapsed(true);
++  controller()->SetHovered(true);
++
++  // Let the panel expand via the normal timer.
++  task_environment_.FastForwardBy(base::Milliseconds(300));
++  EXPECT_TRUE(controller()->IsHoverExpanded());
++
++  // Subsequent OnCursorMoved calls should be no-ops (timer already fired).
++  controller()->OnCursorMoved(gfx::Point(10, 200));
++  task_environment_.FastForwardBy(base::Milliseconds(30));
++  controller()->OnCursorMoved(gfx::Point(80, 200));
++  task_environment_.FastForwardBy(base::Milliseconds(30));
++  // State should remain expanded without any re-triggering.
++  EXPECT_TRUE(controller()->IsHoverExpanded());
++}
++
+ }  // namespace tabs

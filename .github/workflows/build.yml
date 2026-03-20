@@ -1,0 +1,106 @@
+name: Build Helium macOS DMG
+
+on:
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Target architecture"
+        required: true
+        default: "arm64"
+        type: choice
+        options:
+          - arm64
+          - x86_64
+
+jobs:
+  build:
+    name: Build Helium (${{ github.event.inputs.arch || 'arm64' }})
+    # macos-latest  = Apple Silicon (arm64)
+    # macos-13      = Intel x86_64  (last Intel GitHub-hosted runner)
+    runs-on: ${{ (github.event.inputs.arch == 'x86_64') && 'macos-13' || 'macos-latest' }}
+    timeout-minutes: 600
+
+    steps:
+      # ── 1. Check out cyfung1031/helium (this repo) at the PR head ─────────
+      #       This becomes the helium-chromium content inside helium-macos.
+      - name: Check out cyfung1031/helium (PR branch)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: helium-chromium
+
+      # ── 2. Check out imputnet/helium-macos (macOS packaging) ─────────────
+      #       submodules:false because we supply our own helium-chromium below.
+      - name: Check out imputnet/helium-macos
+        uses: actions/checkout@v4
+        with:
+          repository: imputnet/helium-macos
+          ref: main
+          path: helium-macos
+          submodules: false
+
+      # ── 3. Place helium-chromium inside helium-macos ──────────────────────
+      #       git refuses symlinks as submodule paths, so we move the real
+      #       directory instead. env.sh resolves _main_repo via greadlink -f,
+      #       so a plain directory at the expected path is all that's needed.
+      - name: Wire helium-chromium into helium-macos
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/helium-macos/helium-chromium"
+          cp -a  "$GITHUB_WORKSPACE/helium-chromium" \
+                 "$GITHUB_WORKSPACE/helium-macos/helium-chromium"
+
+      # ── 4. Install Homebrew dependencies ─────────────────────────────────
+      - name: Install Homebrew dependencies
+        run: |
+          brew install python@3 llvm ninja coreutils readline xz zlib node
+          brew unlink binutils || true
+
+      # Fix 1: install PySocks alongside httplib2.
+      # depot_tools/gerrit_util.py does `import httplib2.socks` which falls
+      # back to `import socks` (PySocks). Without it gclient crashes with
+      # "No module named 'socks'" before any source download completes.
+      - name: Install Python dependencies
+        run: pip3 install httplib2 PySocks --break-system-packages
+
+      # ── 5. Expose LLVM to the build ───────────────────────────────────────
+      - name: Configure LLVM environment
+        run: |
+          LLVM_PREFIX="$(brew --prefix llvm)"
+          echo "LDFLAGS=-L${LLVM_PREFIX}/lib"      >> "$GITHUB_ENV"
+          echo "CPPFLAGS=-I${LLVM_PREFIX}/include" >> "$GITHUB_ENV"
+          echo "${LLVM_PREFIX}/bin"                >> "$GITHUB_PATH"
+
+      # ── 6. Install appdmg (used by sign_and_package_app.sh when present) ──
+      - name: Install appdmg
+        run: npm install -g appdmg
+
+      # ── 7. Select Xcode ───────────────────────────────────────────────────
+      - name: Select Xcode
+        run: sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+
+      # ── 8. Cache the Chromium download cache ─────────────────────────────
+      - name: Cache Chromium download cache
+        uses: actions/cache@v4
+        with:
+          path: helium-macos/build/download_cache
+          key: dl-cache-${{ runner.arch }}-${{ hashFiles('helium-chromium/chromium_version.txt', 'helium-chromium/downloads.ini', 'helium-chromium/deps.ini', 'helium-macos/downloads.ini') }}
+          restore-keys: |
+            dl-cache-${{ runner.arch }}-
+
+      # ── 9. Build ──────────────────────────────────────────────────────────
+      - name: Build
+        working-directory: helium-macos
+        run: ./build.sh ${{ github.event.inputs.arch || 'arm64' }}
+        env:
+          NEEDS_APPDMG: "1"
+
+      # ── 10. Upload the DMG as a build artifact ────────────────────────────
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helium-pr-${{ github.event.pull_request.number || 'manual' }}-${{ github.event.inputs.arch || 'arm64' }}-macos
+          path: helium-macos/build/*.dmg
+          if-no-files-found: error
+          retention-days: 14

@@ -1,6 +1,8 @@
 name: Check patch series correctness
 
-on: [push, pull_request]
+on:
+    schedule:
+        - cron: '30 1 * * *'
 
 permissions:
   contents: read
